@@ -1,0 +1,1 @@
+"""Shared miner-side helpers for solver strategies."""
