@@ -1,43 +1,45 @@
 """Minotaur Subnet 112 miner solver (king-01).
 
-v3.1 — accurate quote of the EXACT route genesis chose, bounded and crash-safe.
+v4.0 — accurate pricing of genesis's EXACT route, single- AND multi-hop.
 
-Under the post-#181 self-quote rule the benchmark sets
-``min_output = estimate * (1 - 50%)``, so the JS output term collapses to:
+Why this is the durable #1 design (not a gas/score trick):
 
-    outputScore = min(1.0, delivered / estimate)
+The live JS scorer is
+    finalScore = outputScore*0.7 + gasScore*0.15 + impactScore*0.15
+    outputScore = min(1, delivered/estimate)            (under self-quote min)
+    gasScore    = max(0, 1 - gasUsed/1e6)                (gasUsed = SIM actual)
+    impactScore = max(0, 1 - |priceImpact|*20)
 
-i.e. the ONLY thing that matters for the (0.7-weighted) output term is that we
-do not over-estimate. Genesis quotes with the single-tick ``compute_v3_output``
-pool-math, which over-estimates on tick-crossing / illiquid orders — it delivers
-as little as ~50% of its own estimate, so those cases score ~0.58 instead of
-~0.92. Fix: re-price genesis's OWN chosen route with the real multi-tick
-QuoterV2 and return a slightly conservative value, so ``delivered >= estimate``
-and outputScore saturates at 1.0.
+Genesis's own measurement: a 1-hop swap burns 508k-526k gas, of which ~400k is
+FIXED app-harness overhead (ephemeral proxy deploy, EIP-712 verify, intent
+wrapper, fee capture, delivery) that NO solver can avoid. So gasScore ~= 0.49 is
+a universal hard ceiling, and the practical finalScore ceiling on liquid swaps
+is ~0.92 for EVERYONE. You cannot win "top for a long time" by scoring higher on
+the easy cases — nobody can. You win by leaving NO case where you score low and
+a challenger scores high. There are exactly two such case classes, both about
+not over-estimating:
 
-What changed v3.0 -> v3.1 (the v3.0 round crashed on WETH_to_USDC_xl with
-"Solver process is not running", had_plan=false — the solver was KILLED during
-quote):
-  * v3.0 fanned out across ALL of a venue's tiers (4 Uni fees + 5 Aero
-    tickSpacings = up to 9 eth_calls per quote). On the 5-WETH xl order the
-    serial RPC fan-out blew the per-case quote budget and the worker was killed.
-  * v3.1 re-prices ONLY the single tier genesis already chose, read straight
-    from the quote metadata (``pools``/``fees``/``protocol``): 1 eth_call for a
-    Uniswap hop, 2 for an Aerodrome hop (read ``tickSpacing()`` then quote). A
-    wall-clock deadline bails to a conservative haircut before any budget blows.
-  * This is also MORE correct: pricing the exact pool the plan executes
-    guarantees ``estimate <= delivered``. v3.0's "max over all tiers" could pick
-    a tier genesis does NOT execute, making estimate > delivered and LOWERING
-    the score.
-  * Dropped the v3.0 "direct-pool coverage" override entirely: it never improved
-    a case (WETH/DAI's direct pool is too shallow; its guard always kept
-    genesis) and it referenced an undefined ``_QUOTER_V2`` (latent NameError on
-    any multi-hop / no-route case).
+  1. Over-estimate orders — genesis's single-tick pool-math over-quotes, so
+     outputScore collapses (delivered/estimate ~= 0.5 -> case ~0.58). Accurate
+     re-pricing pins estimate just under delivered -> outputScore = 1.0 (~0.92).
+  2. Genesis-failed multi-hop (e.g. WETH->DAI) — genesis over-estimates the
+     multi-hop, min_output is set too high, and the swap REVERTS -> 0.0. A
+     challenger that prices it accurately scores ~0.92 and beats us on that case.
 
-Routing is UNCHANGED — we re-price the exact route genesis already picked (same
-pool/fee), so there is no plan divergence, no malformed hops, no coverage
-regression. Multi-hop and any quoter failure fall to a conservative haircut of
-genesis's own estimate. Never raises; never more than two view eth_calls.
+v3.1 fixed (1) for SINGLE-hop only; multi-hop fell to a crude blind haircut that
+also bleeds score to the app's CoW fee (it skims a share of the surplus ABOVE
+our quoted_output, so under-quoting hands money away). v4.0 extends accurate
+pricing to MULTI-HOP: it re-derives genesis's exact route (pool discovery is
+cached -> ~free) and prices every leg through the real multi-tick QuoterV2,
+chaining current->next per hop. estimate = composed_output * 0.99, so
+delivered >= estimate (outputScore = 1.0) AND the quote sits just under delivery
+(near-zero fee skim). Routing is genesis's, untouched — we only correct the
+estimate, so no plan divergence / malformed-hop reverts (the v2.2 failure).
+
+Crash-safety carried from v3.1: bounded work (one quoter eth_call per leg; tier
+comes from the cached pool_state, no extra reads), a wall-clock deadline that
+bails to a conservative haircut, and a quote() that never raises out of the
+re-pricing step.
 """
 
 from __future__ import annotations
@@ -61,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "3.1.0")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "4.0.0")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -70,27 +72,30 @@ _UNI_QUOTER = {8453: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"}
 _AERO_QUOTER = {8453: "0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0"}
 _SEL_UNI_SINGLE = "c6a5026a"   # quoteExactInputSingle((address,address,uint256,uint24,uint160))
 _SEL_AERO_SINGLE = "9e7defe6"  # quoteExactInputSingle((address,address,uint256,int24,uint160))
-_SEL_TICK_SPACING = "d0c93a7c"  # tickSpacing() -> int24
 
 # Slight conservative margin so realized output clears the returned estimate
-# (outputScore = min(1, delivered/estimate) = 1.0). We price the EXACT pool the
-# plan executes, so 1% absorbs ordinary block-to-block drift. The blind fallback
-# (multi-hop / quoter down) haircuts genesis's possibly-inflated estimate harder.
+# (outputScore = min(1, delivered/estimate) = 1.0) while staying just under
+# delivery to minimise the app's CoW fee skim. We price the EXACT pools the plan
+# executes, so 1% absorbs ordinary block-to-block drift. The blind fallback
+# (route re-derivation failed) haircuts genesis's possibly-inflated estimate.
 _REPRICE_SAFETY = float(os.environ.get("KING_REPRICE_SAFETY", "0.99"))    # 1%
 _BLIND_SAFETY = float(os.environ.get("KING_BLIND_SAFETY", "0.90"))        # 10%
 
-# Hard wall-clock budget for the whole re-pricing step. With <=2 calls this is
-# never hit in practice; it is the backstop that guarantees we bail to the
-# conservative haircut rather than let a slow RPC get the worker killed (the
-# v3.0 xl crash). Bounded call count is the primary guard; this is belt+braces.
+# Hard wall-clock budget for the whole re-pricing step. With one call per leg
+# this is never hit in practice; it is the backstop that guarantees we bail to
+# the conservative haircut rather than let a slow RPC get the worker killed.
 _QUOTE_BUDGET_S = float(os.environ.get("KING_QUOTE_BUDGET_S", "6.0"))
+
+# Don't re-price absurdly long routes (keeps work bounded; genesis routes are
+# 1-2 hops in practice). Longer routes fall back to the conservative haircut.
+_MAX_REPRICE_HOPS = int(os.environ.get("KING_MAX_REPRICE_HOPS", "3"))
 
 
 class MinerSolver(BaselineSwapSolver):
     """Genesis baseline + QuoterV2-accurate, slightly-conservative quote.
 
-    Only the ``estimated_output`` number is corrected; routing and plan
-    generation are genesis's, untouched.
+    Only ``estimated_output`` is corrected; routing and plan generation are
+    genesis's, untouched.
     """
 
     def _qcall(self, chain_id: int, to_addr: str, data_hex: str) -> int:
@@ -120,39 +125,94 @@ class MinerSolver(BaselineSwapSolver):
         ).hex()
         return self._qcall(chain_id, _AERO_QUOTER.get(int(chain_id), ""), data)
 
-    def _read_tick_spacing(self, chain_id, pool_addr) -> int:
-        """Read ``tickSpacing()`` (int24, always positive) off the chosen pool."""
-        return self._qcall(chain_id, pool_addr, _SEL_TICK_SPACING)
+    def _find_best_executable_route(
+        self,
+        pool_states: dict[str, dict[str, Any]],
+        token_in: str, token_out: str, amount_in: int, chain_id: int,
+    ):
+        """Genesis's route finder, unchanged — we only STASH the result.
 
-    def _reprice_chosen_tier(
-        self, chain_id, protocol, pools, fees, tin, tout, amt, deadline,
-    ) -> int:
-        """Accurate multi-tick output for the EXACT single-hop tier genesis chose.
-
-        Reads the venue + tier from genesis's quote metadata so we re-price the
-        same pool the plan executes (=> estimate <= delivered). 1 eth_call for
-        Uniswap, 2 for Aerodrome. Returns 0 (=> blind haircut) on any miss or
-        once the wall-clock deadline passes.
+        super().quote() (and generate_plan()) already call this to pick the
+        route; caching it here lets quote() re-price those exact hops without
+        re-running (cached-but-not-free) pool discovery. No routing change.
         """
-        if time.monotonic() > deadline:
-            return 0
-        if "aerodrome" in protocol:
-            if not pools:
-                return 0
-            ts = self._read_tick_spacing(chain_id, pools[0])
-            if ts <= 0 or time.monotonic() > deadline:
-                return 0
-            return self._aero_single(chain_id, tin, tout, amt, ts)
-        # uniswap / default: re-quote the exact fee tier genesis picked
-        if not fees:
-            return 0
+        route = super()._find_best_executable_route(
+            pool_states, token_in, token_out, amount_in, chain_id,
+        )
         try:
-            fee = int(fees[0])
+            self._king_last_route = {
+                "key": (
+                    (token_in or "").lower(), (token_out or "").lower(),
+                    int(amount_in), int(chain_id),
+                ),
+                "hops": route[2] if route else None,
+            }
+        except Exception:
+            self._king_last_route = None
+        return route
+
+    def _accurate_route_output(
+        self, chain_id: int, hops: list[dict[str, Any]],
+        token_in: str, token_out: str, amount_in: int, deadline: float,
+    ) -> int:
+        """Price genesis's exact route leg-by-leg via the real multi-tick quoter.
+
+        Chains ``current -> next`` through each hop's pool (tier read from the
+        already-discovered pool_state, so one quoter eth_call per leg, no extra
+        reads). Returns the composed output, or 0 to fall back to the haircut.
+        Single- and multi-hop are the same walk (1 leg vs N).
+        """
+        if not hops or len(hops) > _MAX_REPRICE_HOPS:
+            return 0
+        current = (token_in or "").lower()
+        target = (token_out or "").lower()
+        try:
+            amt = int(amount_in)
         except (TypeError, ValueError):
             return 0
-        if fee <= 0:
+
+        for hop in hops:
+            if amt <= 0 or time.monotonic() > deadline:
+                return 0
+            ps = hop.get("pool_state") or {}
+            t0 = (ps.get("token0") or "").lower()
+            t1 = (ps.get("token1") or "").lower()
+            if not t0 or not t1:
+                return 0
+            if current == t0:
+                nxt = t1
+            elif current == t1:
+                nxt = t0
+            else:
+                return 0  # route doesn't chain from the current token — bail
+
+            dex = (ps.get("dex") or "uniswap_v3").lower()
+            if "aerodrome" in dex:
+                try:
+                    ts = int(ps.get("tickSpacing") or 0)
+                except (TypeError, ValueError):
+                    return 0
+                if ts <= 0:
+                    return 0
+                out = self._aero_single(chain_id, current, nxt, amt, ts)
+            else:
+                try:
+                    fee = int(ps.get("fee") or hop.get("fee") or 0)
+                except (TypeError, ValueError):
+                    return 0
+                if fee <= 0:
+                    return 0
+                out = self._uni_single(chain_id, current, nxt, amt, fee)
+
+            if out <= 0:
+                return 0
+            amt = out
+            current = nxt
+
+        # Only trust a route that actually reaches the output token.
+        if target and current != target:
             return 0
-        return self._uni_single(chain_id, tin, tout, amt, fee)
+        return amt
 
     def quote(
         self,
@@ -171,12 +231,6 @@ class MinerSolver(BaselineSwapSolver):
         if genesis_est <= 0:
             return q
 
-        meta = q.metadata or {}
-        hops = int(meta.get("hops") or 0)
-        fees = meta.get("fees") or []
-        pools = meta.get("pools") or []
-        protocol = (meta.get("protocol") or "").lower()
-
         swap = self._normalized_swap_params(intent, state)
         token_in = swap.get("input_token", "")
         token_out = swap.get("output_token", "")
@@ -185,25 +239,36 @@ class MinerSolver(BaselineSwapSolver):
         except (TypeError, ValueError):
             amount_in = 0
 
+        meta = q.metadata or {}
+        hops_n = int(meta.get("hops") or 0)
+
         accurate = 0
-        # Re-price genesis's chosen route with the real multi-tick quoter so the
-        # estimate matches what the swap actually delivers (outputScore =
-        # min(1, delivered/estimate)). Single-hop is priced exactly (the same
-        # pool the plan executes); multi-hop falls to the blind haircut.
-        if hops == 1 and amount_in > 0 and token_in and token_out:
-            deadline = time.monotonic() + _QUOTE_BUDGET_S
+        # Re-price genesis's chosen route (single- or multi-hop) with the real
+        # multi-tick quoter so the estimate matches what the swap delivers
+        # (outputScore = min(1, delivered/estimate) = 1.0) without over- or
+        # under-quoting. Uses the hops super().quote() already routed (cached by
+        # our _find_best_executable_route override — no extra discovery). Falls
+        # to the blind haircut only if those hops are unavailable.
+        if amount_in > 0 and token_in and token_out:
             try:
-                real = self._reprice_chosen_tier(
-                    state.chain_id, protocol, pools, fees,
-                    token_in, token_out, amount_in, deadline,
+                last = getattr(self, "_king_last_route", None)
+                want = (
+                    (token_in or "").lower(), (token_out or "").lower(),
+                    amount_in, int(state.chain_id),
                 )
+                hops = last.get("hops") if (last and last.get("key") == want) else None
+                if hops:
+                    deadline = time.monotonic() + _QUOTE_BUDGET_S
+                    real = self._accurate_route_output(
+                        state.chain_id, hops, token_in, token_out, amount_in, deadline,
+                    )
+                    if real > 0:
+                        accurate = int(real * _REPRICE_SAFETY)
             except Exception:
-                real = 0  # never let re-pricing raise out of quote()
-            if real > 0:
-                accurate = int(real * _REPRICE_SAFETY)
+                accurate = 0  # never let re-pricing raise out of quote()
 
         if accurate <= 0:
-            # Multi-hop or quoter unavailable: blind conservative haircut so we
+            # Route re-derivation unavailable: blind conservative haircut so we
             # rarely over-estimate. Never raises the estimate above genesis's.
             accurate = int(genesis_est * _BLIND_SAFETY)
 
@@ -214,8 +279,8 @@ class MinerSolver(BaselineSwapSolver):
             return q
 
         logger.info(
-            "king-01 quote: genesis_est=%d -> accurate=%d (hops=%d, proto=%s, ratio=%.3f)",
-            genesis_est, new_est, hops, protocol or "?", new_est / genesis_est,
+            "king-01 v4 quote: genesis_est=%d -> accurate=%d (hops=%d, ratio=%.3f)",
+            genesis_est, new_est, hops_n, new_est / genesis_est,
         )
         return QuoteResult(
             estimated_output=str(new_est),
@@ -236,8 +301,9 @@ class MinerSolver(BaselineSwapSolver):
             author=SOLVER_AUTHOR,
             description=(
                 "Genesis routing + QuoterV2-accurate conservative quote of the "
-                "exact tier genesis chose (<=2 view eth_calls, budget-guarded) -> "
-                "saturates outputScore without over-estimating"
+                "exact route genesis chose, single- AND multi-hop (one view "
+                "eth_call per leg, budget-guarded) -> outputScore=1.0 everywhere, "
+                "rescues over-estimate reverts, minimal fee skim"
             ),
             supported_chains=base.supported_chains,
             supported_intent_types=base.supported_intent_types,
