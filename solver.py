@@ -126,7 +126,7 @@ logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "7.0.0")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "7.0.1")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -168,14 +168,15 @@ _DISCOVERY_RETRIES = int(os.environ.get("KING_DISCOVERY_RETRIES", "4"))
 # Earlier (4.0 / 22.0) the watchdog fired BELOW the window genesis itself gets,
 # regressing to a blind snapshot plan on heavy pairs (cbBTC) that genesis would
 # have completed under the cap. Give the work thread (nearly) the full window.
-_HARD_QUOTE_DEADLINE_S = float(os.environ.get("KING_HARD_QUOTE_DEADLINE_S", "4.8"))
+_HARD_QUOTE_DEADLINE_S = float(os.environ.get("KING_HARD_QUOTE_DEADLINE_S", "4.7"))
 _HARD_PLAN_DEADLINE_S = float(os.environ.get("KING_HARD_PLAN_DEADLINE_S", "27.0"))
 # Hard clamps: never let an env override push a deadline so close to the harness
 # cap (5s / 30s) that the thread join + RPC-free fallback could cross it. Quote
-# raised 4.6->4.8 to give the work thread more of genesis's window before falling
-# back to the (DAI-less) snapshot; the eager-warmed, RPC-free fallback is sub-ms,
-# so ~0.2s of headroom is ample.
-_HARD_QUOTE_DEADLINE_S = min(_HARD_QUOTE_DEADLINE_S, 4.85)
+# held at 4.7 (verified-clean: 0.30s host-side margin under a black-hole RPC) —
+# the DAI regression's true cause was bounded retries dropping the discovered
+# pool, NOT the watchdog firing early, so 4.7 keeps the safer margin without
+# costing coverage. The eager-warmed, RPC-free fallback is sub-ms.
+_HARD_QUOTE_DEADLINE_S = min(_HARD_QUOTE_DEADLINE_S, 4.75)
 _HARD_PLAN_DEADLINE_S = min(_HARD_PLAN_DEADLINE_S, 28.5)
 
 # Budgets used WITHIN the work thread. The scan's internal deadline is measured
