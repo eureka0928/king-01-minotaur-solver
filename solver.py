@@ -1,53 +1,83 @@
 """Minotaur Subnet 112 miner solver (king-01).
 
-v5.0 — REAL-QUOTE ROUTING (beat genesis's delivered output) + v4.0 accurate quote.
+v6.0 — ROBUST REAL-QUOTE ROUTING. v5's real-quote route selection, made
+*structurally incapable* of the timeout->worker-kill that sank v5.0.2.
 
-The score is ``0.4*synthetic + 0.6*historical`` where each case's on-chain score
-is ``scoreLinear(delivered, min)``. For HISTORICAL orders the min is the order's
-ORIGINAL min (self-quote is skipped — they already carry quoted_output), so the
-score there is pure ROUTING QUALITY: how much our plan DELIVERS. Re-pricing
-(v3.1/v4.0) cannot move it — only delivering MORE output can. Historical is 60%
-of the score, so routing is the dominant lever.
+What killed v5.0.2 (scored 0.31): genesis discovers pools via LIVE, UNBOUNDED
+RPC inside ``generate_plan()``/``quote()`` — ``_get_web3`` has no timeout and
+``_ensure_pools_for_route`` queries the factory across many fee tiers + every
+intermediary + Aerodrome. On a heavy multi-hop pair (cbBTC: no direct pool) that
+discovery alone sits near the 30s worker cap; v5's added scan pushed it OVER, so
+the harness KILLED the worker — and the very next case, the single historical
+order (60% of the score), found a dead process and crashed -> historical_avg=0.
+0.4*0.7695 + 0.6*0.0 = 0.31. One timeout, via the cascade, cost ~0.55 of score.
 
-Genesis routes with single-tick ``compute_v3_output``, which ZEROES any pool swap
-exceeding ~2% price impact (``delta_sqrt_price > sqrtPrice/100 -> return 0``) so
-it finds NO route on large/illiquid orders and reverts to 0, and picks tiers by
-no-slippage estimates. Measured on Base: genesis returns no route on 500+ WETH
-while the real multi-tick QuoterV2 shows the same pool delivers ~868k USDC.
+v6 robustness layers — each guarantees we return well under the harness cap no
+matter how slow or hung the RPC is, so the worker is NEVER killed and the
+cascade is structurally impossible:
 
-v5 overrides route SELECTION with the real QuoterV2: it scans the discovered
-pools' tiers (and same-DEX 2-hops through the chain's hubs) by ACTUAL multi-tick
-output and adopts a route only if it beats genesis's. The plan is built by
-genesis's OWN builders from the chosen hops; the quote is the accurate price.
+  1. HARD WATCHDOG. ``generate_plan()``/``quote()`` run their real work in a
+     daemon thread joined with a hard deadline (plan 22s < 30s; quote 4s < 5s).
+     If it doesn't finish in time we return a SNAPSHOT-ONLY fallback (no RPC ->
+     instant). A hung RPC can stall the work thread forever; the watchdog still
+     returns on time.
+  2. BOUNDED, THREAD-LOCAL DISCOVERY. ``_get_web3`` is overridden to add a hard
+     per-call timeout (so genesis's own discovery calls can't hang) and to be
+     THREAD-LOCAL (so a timed-out, abandoned work thread never shares a socket
+     with the next case's thread).
+  3. THREAD-LOCAL GATES. the scan gate / scan deadline / snapshot-only flag live
+     in a ``threading.local``, so the main-thread fallback never races the
+     abandoned work thread on shared mutable flags.
 
-WHERE THE WORK RUNS (the critical harness constraint):
-  * ``quote()`` has a 5s harness timeout. It only RE-PRICES the already-chosen
-    route (v4.0 logic, <=3 calls). It NEVER runs the route scan. (self-quote is
-    applied only to SYNTHETIC scenarios, which are small enough that genesis
-    routes them fine — so quote() pricing genesis's route is correct.)
-  * ``generate_plan()`` has a 30s budget. The expensive real-quote route SCAN runs
-    ONLY here (gated by ``_king_allow_scan``). This is where the historical-order
-    routing win is realised (delivered output is what the historical score grades).
+v6.1 hardening (from adversarial review — each was a confirmed worker-kill or
+regression the v6.0 watchdog alone did NOT close):
+  * RETRIES DISABLED. web3 7.x silently retries 5x on the eth_call/eth_gasPrice
+    allowlist, multiplying our per-call timeout ~5x (3s -> ~17s). ``_make_web3``
+    sets retries=1 so the per-call timeout is a TRUE ceiling on every provider.
+  * GAS PRICE GATED. genesis's ``_get_gas_price_wei`` issues an UNGATED live
+    eth_gasPrice that the snapshot-only fallback otherwise hit on the MAIN thread
+    AFTER the join — ~21s > the 5s quote cap = worker kill. It is now overridden
+    to return the static chain fallback under ``snapshot_only`` (gas only feeds
+    fee metadata, never output/routing), making the fallback truly RPC-free.
+  * DEADLINES near the caps (plan 27s / quote 4.7s). The fallback is RPC-free and
+    near-instant, so an over-conservative 22s/4s only made the watchdog fire
+    BELOW the window genesis itself gets — regressing to a blind snapshot plan on
+    heavy pairs genesis would have finished under the cap.
+  * PRIVATE POOL DICTS. ``_get_pool_states`` returns a (retry-safe) copy so an
+    abandoned work thread inserting into ``self._pool_cache`` can't trip
+    'dictionary changed size during iteration' in the next case.
+  * NON-REENTRANT WATCHDOG. an ``in_watchdog`` guard makes the substrate-EVM-leg
+    recursion run the genesis body inline instead of stacking a second 22s+22s
+    watchdog (which could double main-thread time past the 30s cap).
 
-Safety rails (every one verified by adversarial review):
-  * NEVER REGRESS: adopt the v5 route only if genesis found NO route at all, OR
-    v5's real output STRICTLY beats genesis's MEASURED real output by a margin
-    (+1% for 2-hop, +0.3% direct). If genesis's route can't be measured (RPC
-    flake -> 0), keep genesis — never switch on an unmeasured comparison.
-  * EXECUTABLE ONLY: 2-hop candidates must be SAME-DEX (one router); direct always
-    executes. Hops carry full pool_state, so genesis's builders accept them.
-  * BOUNDED TIME, two ways: a dedicated quoter web3 with a hard PER-CALL timeout
-    (so a hung RPC can't blow the budget), AND a wall-clock budget measured from
-    generate_plan() entry (so genesis discovery + scan stays under 30s). A
-    per-input decision cache (with TTL) avoids re-scanning. Never raises.
-  * CROSS-CHAIN SAFE: cross-chain orders (via dest_chain_id or CAIP chain ids)
-    route through genesis's bridge path; quote() returns genesis's quote untouched.
+Everything else is v5: real-QuoterV2 route SELECTION in ``generate_plan()`` (beats
+genesis's single-tick router on the large/illiquid orders it zeroes — genesis's
+``compute_v3_output`` ZEROES any pool swap over ~2% price impact, so it finds NO
+route on 500+ WETH while the real multi-tick QuoterV2 shows ~868k USDC), an
+accurate conservative ``quote()``, a strict NEVER-REGRESS guard (adopt a v5 route
+only if genesis found none, or v5's MEASURED real output strictly beats genesis's
+by a margin), and plans built by genesis's OWN builders from well-formed hops.
+
+Scoring model: ``0.4*synthetic_avg + 0.6*historical_avg``; each case scores
+``scoreLinear(delivered, min)`` (0 if delivered<min, 10000 capped if
+delivered>=2*min). HISTORICAL orders keep their ORIGINAL min (self-quote skipped
+— they carry quoted_output), so their score is pure ROUTING/delivered quality:
+re-pricing can't move it, only delivering MORE output can. Historical is 60% of
+the score and a single crash there zeroes the whole 60% — so ROBUSTNESS dominates
+routing gains, which is exactly what v6 buys.
+
+WHERE THE WORK RUNS (the harness constraint):
+  * ``quote()`` (5s cap): only RE-PRICES the already-chosen route (<=3 calls).
+    NEVER runs the route scan.
+  * ``generate_plan()`` (30s cap): the real-quote route SCAN runs ONLY here,
+    gated by a thread-local flag, inside the watchdog thread.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from typing import Any
 
@@ -65,7 +95,7 @@ logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "5.0.2")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "6.2.0")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -83,16 +113,31 @@ _BLIND_SAFETY = float(os.environ.get("KING_BLIND_SAFETY", "0.90"))        # 10%
 
 # Hard PER-CALL timeout for our quoter eth_calls (seconds). A hung RPC otherwise
 # inherits web3's 30s default and blows the worker budget despite the wall-clock
-# deadline (which is only checked BETWEEN calls). Isolated to our own provider so
-# genesis's discovery calls keep their default.
+# deadline (which is only checked BETWEEN calls).
 _RPC_CALL_TIMEOUT_S = float(os.environ.get("KING_RPC_CALL_TIMEOUT_S", "2.5"))
 
-# Budgets. quote()<5s harness cap; generate_plan()<30s cap. The scan budget is
-# measured from generate_plan() ENTRY (covers genesis discovery + scan), not from
-# after discovery, so a cold-cache block can't compound past the worker timeout.
-_QUOTE_BUDGET_S = float(os.environ.get("KING_QUOTE_BUDGET_S", "3.0"))
+# Hard PER-CALL timeout for genesis's OWN pool-discovery calls. v5 left these on
+# web3's unbounded default — the direct cause of the cbBTC_to_WETH 30s kill.
+_DISCOVERY_CALL_TIMEOUT_S = float(os.environ.get("KING_DISCOVERY_CALL_TIMEOUT_S", "3.0"))
+
+# WATCHDOG hard deadlines. These are the wall-clock ceilings on the whole call;
+# if the work thread isn't done by then we return a snapshot-only fallback. Set
+# safely under the harness caps (quote 5s, generate_plan 30s) with room for the
+# thread join + the (RPC-free) fallback.
+# Set close to the harness caps (5s / 30s): the fallback is now RPC-free and
+# near-instant, so we only need a small margin for the thread join + fallback.
+# Earlier (4.0 / 22.0) the watchdog fired BELOW the window genesis itself gets,
+# regressing to a blind snapshot plan on heavy pairs (cbBTC) that genesis would
+# have completed under the cap. Give the work thread (nearly) the full window.
+_HARD_QUOTE_DEADLINE_S = float(os.environ.get("KING_HARD_QUOTE_DEADLINE_S", "4.7"))
+_HARD_PLAN_DEADLINE_S = float(os.environ.get("KING_HARD_PLAN_DEADLINE_S", "27.0"))
+
+# Budgets used WITHIN the work thread. The scan's internal deadline is measured
+# from the work thread's entry and kept well under the plan watchdog so the scan
+# yields before the watchdog ever fires.
+_SCAN_PLAN_BUDGET_S = float(os.environ.get("KING_SCAN_PLAN_BUDGET_S", "16.0"))
 _ROUTE_BUDGET_S = float(os.environ.get("KING_ROUTE_BUDGET_S", "12.0"))      # scan slice
-_PLAN_TOTAL_BUDGET_S = float(os.environ.get("KING_PLAN_TOTAL_BUDGET_S", "20.0"))  # from plan entry
+_QUOTE_BUDGET_S = float(os.environ.get("KING_QUOTE_BUDGET_S", "2.5"))       # repricing slice
 
 # Route-decision cache TTL — its hops embed pool snapshots, so a stale entry must
 # not be reused minutes later.
@@ -115,34 +160,229 @@ _ROUTE_INTERMEDIARIES = {8453: (_USDC_BASE, _WETH_BASE)}
 
 
 class MinerSolver(BaselineSwapSolver):
-    """Genesis baseline + real-quote route selection + QuoterV2-accurate quote."""
+    """Genesis baseline + real-quote route selection + watchdog robustness."""
 
-    # ── quoter primitives ───────────────────────────────────────────────────
-    def _quoter_web3(self, chain_id: int):
-        """A dedicated web3 for our quoter calls, with a HARD per-call timeout.
+    # ── thread-local gates (scan flag / deadline / snapshot-only) ────────────
+    def _tls(self) -> threading.local:
+        tls = getattr(self, "_king_tls", None)
+        if tls is None:
+            tls = self._king_tls = threading.local()
+        return tls
 
-        Separate from genesis's cached provider so our 2.5s cap can't break
-        genesis's (potentially heavier) discovery calls, and so a hung quoter RPC
-        returns fast instead of blowing the worker budget.
+    # ── hard watchdog: run work in a daemon thread, fall back if it overruns ─
+    def _run_with_watchdog(self, work, deadline_s: float, fallback):
+        """Return ``work()`` if it finishes within ``deadline_s``; else (or if it
+        raised) return ``fallback()``. The work thread is a daemon, so an
+        abandoned (hung) one never blocks process exit. We NEVER block past
+        ``deadline_s`` — that is the whole point: the harness must never see a
+        timeout and kill the worker.
         """
+        box: dict[str, Any] = {}
+
+        def _runner():
+            try:
+                box["v"] = work()
+            except BaseException as exc:  # noqa: BLE001 — capture everything
+                box["e"] = exc
+
+        t = threading.Thread(target=_runner, name="king-watchdog", daemon=True)
+        t.start()
+        t.join(deadline_s)
+
+        if not t.is_alive() and "v" in box:
+            return box["v"]
+
+        # Timed out (still alive) or finished by raising: take the fast,
+        # RPC-free fallback. If even that fails, re-raise the original error
+        # (a clean error keeps the worker alive — only a TIMEOUT kills it, and
+        # the watchdog has already prevented that).
+        try:
+            return fallback()
+        except Exception:
+            if "e" in box:
+                raise box["e"]
+            raise
+
+    # ── web3 builder: hard per-call timeout AND retries DISABLED ─────────────
+    @staticmethod
+    def _make_web3(rpc_url: str, timeout: float):
+        """Build a Web3 whose per-call timeout is a TRUE wall-clock ceiling.
+
+        web3 7.x defaults the HTTPProvider to retries=5 on the
+        eth_call/eth_gasPrice/eth_getStorageAt allowlist, silently multiplying
+        the requests ``timeout`` ~5x (a 3s call becomes ~17s on a hung/throttling
+        RPC). That defeats the per-call bound the watchdog budgets around and was
+        a confirmed worker-kill path. retries=1 (one attempt) restores the
+        per-call timeout as a real ceiling.
+        """
+        from web3 import Web3
+        prov = Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": timeout})
+        try:
+            from web3.providers.rpc.utils import ExceptionRetryConfiguration
+            import requests as _rq
+            prov.exception_retry_configuration = ExceptionRetryConfiguration(
+                errors=(
+                    _rq.exceptions.ConnectionError,
+                    _rq.exceptions.HTTPError,
+                    _rq.exceptions.Timeout,
+                ),
+                retries=1,
+                backoff_factor=0.0,
+            )
+        except Exception:
+            try:
+                prov.exception_retry_configuration.retries = 1
+            except Exception:
+                pass
+        return Web3(prov)
+
+    # ── bounded, thread-local discovery web3 (overrides genesis's unbounded) ─
+    def _get_web3(self, chain_id: int) -> Any:
+        """Genesis's discovery web3, but with a HARD per-call timeout and kept
+        THREAD-LOCAL. Bounding the per-call timeout stops a single hung discovery
+        call from eating the whole budget (v5.0.2's failure); the thread-local
+        cache stops an abandoned work thread from sharing a requests session with
+        the next case's thread.
+        """
+        tls = self._tls()
+        cache = getattr(tls, "disc_web3", None)
+        if cache is None:
+            cache = tls.disc_web3 = {}
+        if chain_id in cache:
+            return cache[chain_id]
+        rpc_url = self._rpc_urls.get(chain_id)
+        if not rpc_url:
+            cache[chain_id] = None
+            return None
+        try:
+            w3 = self._make_web3(rpc_url, _DISCOVERY_CALL_TIMEOUT_S)
+            cache[chain_id] = w3
+            return w3
+        except Exception:
+            cache[chain_id] = None
+            return None
+
+    def _get_gas_price_wei(self, chain_id: int) -> int:
+        """In the snapshot-only fallback (post-watchdog, MAIN thread) never do
+        live RPC. Genesis's _get_gas_price_wei issues a live eth_gasPrice that is
+        otherwise UNGATED — on a hung RPC it runs AFTER the watchdog join has
+        already spent most of the budget, blowing the cap and killing the worker
+        (confirmed critical). Gas price only feeds fee metadata (not
+        estimated_output or routing), so the static chain fallback costs nothing
+        on score.
+        """
+        if getattr(self._tls(), "snapshot_only", False):
+            try:
+                from strategies.dex_aggregator.baseline_solver import (
+                    _FALLBACK_GAS_PRICE_WEI, _GENERIC_FALLBACK_GAS_PRICE_WEI,
+                )
+                return _FALLBACK_GAS_PRICE_WEI.get(
+                    int(chain_id), _GENERIC_FALLBACK_GAS_PRICE_WEI,
+                )
+            except Exception:
+                return 1_000_000_000  # 1 gwei generic
+        return super()._get_gas_price_wei(chain_id)
+
+    # ── snapshot-only path (used by the watchdog fallback — no RPC) ──────────
+    @staticmethod
+    def _safe_copy(d):
+        """Copy a pool-states dict that an ABANDONED watchdog work thread may be
+        concurrently mutating. dict(d) can raise 'dictionary changed size during
+        iteration'; inserts are sparse (after multi-second RPC batches), so a few
+        retries reliably capture a stable snapshot."""
+        if not d:
+            return {}
+        for _ in range(6):
+            try:
+                return dict(d)
+            except RuntimeError:
+                continue
+        try:
+            return {k: v for k, v in list(d.items())}
+        except RuntimeError:
+            return {}
+
+    def _get_pool_states(self, chain_id, snapshot):
+        if getattr(self._tls(), "snapshot_only", False):
+            if snapshot is not None and snapshot.pool_states:
+                return dict(snapshot.pool_states)
+            return {}
+        # Private copy: genesis returns self._pool_cache[chain_id] BY REFERENCE,
+        # which an abandoned work thread from a prior case may still be inserting
+        # into. Work on our own dict so iteration here (and genesis's) can't race
+        # that mutation -> no "dictionary changed size during iteration".
+        return self._safe_copy(super()._get_pool_states(chain_id, snapshot))
+
+    def _discover_pools(self, chain_id):
+        """Genesis's _discover_pools iterates self._pair_discovery_cache
+        (`stale = [k for k in self._pair_discovery_cache ...]`) which an ABANDONED
+        watchdog work thread may still be inserting into -> 'dictionary changed
+        size during iteration'. That fires INSIDE this call (before any value is
+        returned), so _safe_copy on the return value can't catch it. Inserts are
+        sparse (one per multi-second RPC batch); retry a few times, then fall back
+        to the last good cache."""
+        for _ in range(6):
+            try:
+                return super()._discover_pools(chain_id)
+            except RuntimeError:
+                continue
+        try:
+            return getattr(self, "_pool_cache", {}).get(chain_id, {})
+        except Exception:
+            return {}
+
+    def _ensure_pools_for_route(self, chain_id, pool_states, token_in, token_out):
+        if getattr(self._tls(), "snapshot_only", False):
+            return pool_states  # no live discovery in the fallback
+        return super()._ensure_pools_for_route(chain_id, pool_states, token_in, token_out)
+
+    def _generate_yield_plan(self, intent, state, snapshot=None):
+        """The yield/rebalance path delegates to BaselineYieldStrategy, which
+        queries Aave/Compound rates via raw urllib (timeout=10s/call) — bypassing
+        our bounded web3 entirely. In the snapshot-only FALLBACK (post-watchdog,
+        MAIN thread) it must do ZERO network I/O: otherwise it re-runs the ~30s
+        urllib sweep on top of the 27s join and blows the 30s cap (worker kill +
+        cascade). The yield strategy no-ops both rate queries when its rpc_url is
+        falsy (its only source is os.environ['ANVIL_RPC_URL']) and returns a
+        deterministic Aave-default plan — so clearing it makes the fallback
+        instant. The work-thread path keeps live rate optimisation; if it overruns
+        the watchdog, it is abandoned and this RPC-free fallback bounds the total.
+        """
+        if not getattr(self._tls(), "snapshot_only", False):
+            return super()._generate_yield_plan(intent, state, snapshot)
+        prev = os.environ.get("ANVIL_RPC_URL")
+        try:
+            if prev:
+                os.environ["ANVIL_RPC_URL"] = ""
+            return super()._generate_yield_plan(intent, state, snapshot)
+        finally:
+            if prev:
+                os.environ["ANVIL_RPC_URL"] = prev
+
+    # ── quoter primitives (timeout-bounded, thread-local) ───────────────────
+    def _quoter_web3(self, chain_id: int):
+        """A dedicated web3 for our quoter calls, with a HARD per-call timeout,
+        thread-local so concurrent (abandoned + live) threads never share it."""
         try:
             cid = int(chain_id)
         except (TypeError, ValueError):
             return None
-        cache = getattr(self, "_king_quoter_web3", None)
+        tls = self._tls()
+        cache = getattr(tls, "quoter_web3", None)
         if cache is None:
-            cache = self._king_quoter_web3 = {}
+            cache = tls.quoter_web3 = {}
         if cid in cache:
             return cache[cid]
         rpc_url = self._rpc_urls.get(cid)
         if not rpc_url:
+            cache[cid] = None
             return None
         try:
-            from web3 import Web3
-            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": _RPC_CALL_TIMEOUT_S}))
+            w3 = self._make_web3(rpc_url, _RPC_CALL_TIMEOUT_S)
             cache[cid] = w3
             return w3
         except Exception:
+            cache[cid] = None
             return None
 
     def _qcall(self, chain_id: int, to_addr: str, data_hex: str) -> int:
@@ -298,20 +538,47 @@ class MinerSolver(BaselineSwapSolver):
                 best_out, best_hops = leg2[0], [leg1[1], leg2[1]]
         return best_out, best_hops
 
-    # ── plan generation: enable the route scan here (30s budget) ────────────
+    # ── plan generation: watchdog + the route scan (30s budget) ─────────────
     def generate_plan(self, intent, state, snapshot=None):
-        """Genesis plan generation with the v5 route scan enabled.
-
-        Stamps a wall-clock deadline from ENTRY so genesis discovery + our scan
-        together stay under the 30s worker budget.
+        """Genesis plan generation with the v5 route scan, wrapped in a hard
+        watchdog. The scan-enabled work runs in a daemon thread; if it overruns
+        the watchdog we return a snapshot-only plan (no RPC) rather than let the
+        harness time out and kill the worker.
         """
-        self._king_allow_scan = True
-        self._king_plan_deadline = time.monotonic() + _PLAN_TOTAL_BUDGET_S
-        try:
-            return super().generate_plan(intent, state, snapshot)
-        finally:
-            self._king_allow_scan = False
-            self._king_plan_deadline = None
+        # Reentrancy guard: genesis's substrate-to-EVM path recurses into
+        # self.generate_plan for the EVM leg. Never stack a second watchdog (that
+        # would let the main-thread time double past the 30s cap); run the genesis
+        # body inline within the already-running outer budget (and, in the
+        # fallback, under the inherited snapshot_only -> RPC-free).
+        if getattr(self._tls(), "in_watchdog", False):
+            return BaselineSwapSolver.generate_plan(self, intent, state, snapshot)
+
+        def _work():
+            tls = self._tls()
+            tls.in_watchdog = True
+            tls.allow_scan = True
+            tls.snapshot_only = False
+            tls.deadline = time.monotonic() + _SCAN_PLAN_BUDGET_S
+            try:
+                return BaselineSwapSolver.generate_plan(self, intent, state, snapshot)
+            finally:
+                tls.in_watchdog = False
+                tls.allow_scan = False
+                tls.deadline = None
+
+        def _fallback():
+            tls = self._tls()  # main thread's TLS — independent of the work thread
+            prev = getattr(tls, "snapshot_only", False)
+            tls.in_watchdog = True
+            tls.allow_scan = False
+            tls.snapshot_only = True
+            try:
+                return BaselineSwapSolver.generate_plan(self, intent, state, snapshot)
+            finally:
+                tls.in_watchdog = False
+                tls.snapshot_only = prev
+
+        return self._run_with_watchdog(_work, _HARD_PLAN_DEADLINE_S, _fallback)
 
     def _find_best_executable_route(
         self,
@@ -332,7 +599,8 @@ class MinerSolver(BaselineSwapSolver):
             key = None
 
         now = time.monotonic()
-        allow_scan = bool(getattr(self, "_king_allow_scan", False))
+        tls = self._tls()
+        allow_scan = bool(getattr(tls, "allow_scan", False))
 
         cache = getattr(self, "_king_route_decision", None)
         if (
@@ -349,8 +617,8 @@ class MinerSolver(BaselineSwapSolver):
             try:
                 if pool_states and amt > 0 and token_in and token_out:
                     # Bound the scan by BOTH a fresh slice budget and the absolute
-                    # plan deadline (covers prior genesis discovery time).
-                    plan_dl = getattr(self, "_king_plan_deadline", None)
+                    # scan deadline (covers prior genesis discovery time).
+                    plan_dl = getattr(tls, "deadline", None)
                     deadline = now + _ROUTE_BUDGET_S
                     if plan_dl is not None:
                         deadline = min(deadline, plan_dl)
@@ -376,7 +644,7 @@ class MinerSolver(BaselineSwapSolver):
                             if g_real > 0 and v_out > g_real * margin:
                                 chosen = (v_out, "king v5 real-route", v_hops)
                                 logger.info(
-                                    "king-01 v5 route: %s->%s amt=%d  genesis_real=%d -> v5=%d (hops=%d)",
+                                    "king-01 v6 route: %s->%s amt=%d  genesis_real=%d -> v5=%d (hops=%d)",
                                     token_in[:8], token_out[:8], amt, g_real, v_out, len(v_hops),
                                 )
             except Exception:
@@ -417,7 +685,42 @@ class MinerSolver(BaselineSwapSolver):
         state: IntentState,
         snapshot=None,
     ) -> QuoteResult:
-        q = super().quote(intent, state, snapshot)  # routes via our override (no scan)
+        """Accurate conservative quote, wrapped in a hard watchdog. The real work
+        (genesis quote + our re-pricing, which still does live discovery) runs in
+        a daemon thread; on overrun we return a snapshot-only genesis quote rather
+        than risk a 5s timeout that would kill the worker.
+        """
+        if getattr(self._tls(), "in_watchdog", False):
+            return self._quote_impl(intent, state, snapshot)
+
+        def _work():
+            tls = self._tls()
+            tls.in_watchdog = True
+            try:
+                return self._quote_impl(intent, state, snapshot)
+            finally:
+                tls.in_watchdog = False
+
+        def _fallback():
+            tls = self._tls()
+            prev = getattr(tls, "snapshot_only", False)
+            tls.in_watchdog = True
+            tls.snapshot_only = True
+            try:
+                return BaselineSwapSolver.quote(self, intent, state, snapshot)
+            finally:
+                tls.in_watchdog = False
+                tls.snapshot_only = prev
+
+        return self._run_with_watchdog(_work, _HARD_QUOTE_DEADLINE_S, _fallback)
+
+    def _quote_impl(
+        self,
+        intent: AppIntentDefinition,
+        state: IntentState,
+        snapshot,
+    ) -> QuoteResult:
+        q = BaselineSwapSolver.quote(self, intent, state, snapshot)  # via our override (no scan)
 
         # Cross-chain orders route through genesis's bridge path (estimated_output
         # = bridged, computed_params carry the bridge min). Do NOT re-price/slash
@@ -473,7 +776,7 @@ class MinerSolver(BaselineSwapSolver):
             return q
 
         logger.info(
-            "king-01 v5 quote: genesis_est=%d -> est=%d (hops=%d, ratio=%.3f)",
+            "king-01 v6 quote: genesis_est=%d -> est=%d (hops=%d, ratio=%.3f)",
             genesis_est, new_est, hops_n, (new_est / genesis_est) if genesis_est else 0,
         )
         return QuoteResult(
@@ -496,8 +799,9 @@ class MinerSolver(BaselineSwapSolver):
             description=(
                 "Genesis baseline + real-quote route selection in generate_plan "
                 "(beats genesis's single-tick router on large/illiquid orders it "
-                "zeroes) + QuoterV2-accurate conservative quote; plans built by "
-                "genesis's own builders from well-formed hops"
+                "zeroes) + QuoterV2-accurate conservative quote; hard watchdog + "
+                "bounded thread-local discovery make timeouts/worker-kills "
+                "structurally impossible; plans built by genesis's own builders"
             ),
             supported_chains=base.supported_chains,
             supported_intent_types=base.supported_intent_types,
