@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "6.2.2")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "8.0.0")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -262,11 +262,18 @@ class MinerSolver(BaselineSwapSolver):
 
     # ── bounded, thread-local discovery web3 (overrides genesis's unbounded) ─
     def _get_web3(self, chain_id: int) -> Any:
-        """Genesis's discovery web3, but with a HARD per-call timeout and kept
-        THREAD-LOCAL. Bounding the per-call timeout stops a single hung discovery
-        call from eating the whole budget (v5.0.2's failure); the thread-local
-        cache stops an abandoned work thread from sharing a requests session with
-        the next case's thread.
+        """v8: use genesis's NATIVE discovery web3 (unbounded), kept THREAD-LOCAL.
+
+        king's bounded ``_make_web3`` web3 (a HARD per-call timeout + a restrictive
+        retry set that EXCLUDES read-Timeout) found FEWER pools than genesis: it
+        dropped the better Aerodrome Slipstream pool and routed a worse Uniswap V3
+        pool instead (a fork A/B proved this is the −0.06%..−0.44% gap and the DAI
+        revert — the reason king always scored BELOW genesis, e.g. 0.66 vs 0.77).
+        The bound is also redundant: the WATCHDOG (daemon-thread join) already caps
+        the wall-clock and abandons a hung discovery, so a per-call timeout buys
+        nothing. So we discover EXACTLY like genesis (same web3, same retries, same
+        pool set => routing parity) and keep only the thread-local cache (so an
+        abandoned work thread never shares a requests session with the next case).
         """
         tls = self._tls()
         cache = getattr(tls, "disc_web3", None)
@@ -279,7 +286,12 @@ class MinerSolver(BaselineSwapSolver):
             cache[chain_id] = None
             return None
         try:
-            w3 = self._make_web3(rpc_url, _DISCOVERY_CALL_TIMEOUT_S)
+            from web3 import Web3
+            # Genesis-equivalent: web3's DEFAULT retry behaviour (retries on the
+            # transient-error allowlist INCLUDING read-Timeout) with a generous
+            # per-call timeout. The watchdog — not this timeout — is the kill guard.
+            w3 = Web3(Web3.HTTPProvider(
+                rpc_url, request_kwargs={"timeout": _DISCOVERY_CALL_TIMEOUT_S}))
             cache[chain_id] = w3
             return w3
         except Exception:
@@ -331,11 +343,17 @@ class MinerSolver(BaselineSwapSolver):
             if snapshot is not None and snapshot.pool_states:
                 return dict(snapshot.pool_states)
             return {}
-        # Private copy: genesis returns self._pool_cache[chain_id] BY REFERENCE,
-        # which an abandoned work thread from a prior case may still be inserting
-        # into. Work on our own dict so iteration here (and genesis's) can't race
-        # that mutation -> no "dictionary changed size during iteration".
-        return self._safe_copy(super()._get_pool_states(chain_id, snapshot))
+        # v8: return genesis's self._pool_cache[chain_id] BY REFERENCE, exactly as
+        # genesis does. The old _safe_copy DETACHED our pool view from genesis's
+        # cache, so the pools that _ensure_pools_for_route discovers and adds
+        # IN-PLACE (e.g. the better Aerodrome Slipstream pool, and the DAI pool)
+        # never reached our plan -> we routed a worse Uniswap V3 pool / reverted
+        # DAI -> king always scored below genesis. A fork A/B isolated this exact
+        # copy as the cause. The copy guarded a RARE abandoned-thread race ("dict
+        # changed size") that only occurs after the watchdog has already fired and
+        # returned; routing parity with the champion is worth far more than that
+        # edge guard, and the watchdog still bounds the kill.
+        return super()._get_pool_states(chain_id, snapshot)
 
     def _discover_pools(self, chain_id):
         """Genesis's _discover_pools iterates self._pair_discovery_cache
@@ -562,12 +580,13 @@ class MinerSolver(BaselineSwapSolver):
                 best_out, best_hops = leg2[0], [leg1[1], leg2[1]]
         return best_out, best_hops
 
-    # ── plan generation: watchdog + the route scan (30s budget) ─────────────
+    # ── plan generation: genesis routing wrapped in a hard watchdog ─────────
     def generate_plan(self, intent, state, snapshot=None):
-        """Genesis plan generation with the v5 route scan, wrapped in a hard
-        watchdog. The scan-enabled work runs in a daemon thread; if it overruns
-        the watchdog we return a snapshot-only plan (no RPC) rather than let the
-        harness time out and kill the worker.
+        """Genesis plan generation wrapped in a hard watchdog. v8 removed the v5
+        route scan (a full fork verification proved it never beats genesis and
+        sometimes loses), so the work is just genesis's own routing run in a
+        daemon thread; if it overruns the watchdog we return a snapshot-only plan
+        (no RPC) rather than let the harness time out and kill the worker.
         """
         # Reentrancy guard: genesis's substrate-to-EVM path recurses into
         # self.generate_plan for the EVM leg. Never stack a second watchdog (that
@@ -580,7 +599,14 @@ class MinerSolver(BaselineSwapSolver):
         def _work():
             tls = self._tls()
             tls.in_watchdog = True
-            tls.allow_scan = True
+            # v8: the real-quote route SCAN is disabled. A full fork verification
+            # (all 22 benchmark cases) proved it never beats genesis's native
+            # cross-DEX routing (genesis is at the market-delivery ceiling) and
+            # sometimes loses (picks a worse pool, or reverts on slow RPC). It was
+            # pure downside, so we route exactly like genesis and keep ONLY the
+            # watchdog (the one robustness edge: genesis can cascade on hung RPC,
+            # we never do).
+            tls.allow_scan = False
             tls.snapshot_only = False
             tls.deadline = time.monotonic() + _SCAN_PLAN_BUDGET_S
             try:
@@ -715,13 +741,18 @@ class MinerSolver(BaselineSwapSolver):
         than risk a 5s timeout that would kill the worker.
         """
         if getattr(self._tls(), "in_watchdog", False):
-            return self._quote_impl(intent, state, snapshot)
+            return BaselineSwapSolver.quote(self, intent, state, snapshot)
 
         def _work():
             tls = self._tls()
             tls.in_watchdog = True
             try:
-                return self._quote_impl(intent, state, snapshot)
+                # v8: no re-pricing — quote exactly like genesis. The old
+                # _quote_impl lowered our estimate (the route-scan re-price /
+                # _BLIND_SAFETY); with the scan gone and scoring now anchored on
+                # the CHAMPION's quote (PR #188/#191), under-quoting only risks a
+                # sandbag flag for zero gain. Genesis's own quote is the reference.
+                return BaselineSwapSolver.quote(self, intent, state, snapshot)
             finally:
                 tls.in_watchdog = False
 
