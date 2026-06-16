@@ -91,11 +91,25 @@ from minotaur_subnet.shared.types import (
     QuoteResult,
 )
 
+# Eager-warm the modules the WATCHDOG FALLBACK imports lazily. Genesis's quote
+# imports `minotaur_subnet.blockchain.tokens` (line ~1941) and `pool_math` inside
+# the function; on the very FIRST quote, if the work thread hangs in discovery
+# (never reaching those imports) the main-thread fallback would pay the cold
+# ~210ms import cost AFTER already spending the 4.6s join — shrinking the 5s
+# margin toward a kill on a slow container. Paying it once here (inside the 60s
+# initialize budget, off the hot path) closes that window. Best-effort: a missing
+# module must not break solver load.
+try:  # noqa: SIM105
+    import minotaur_subnet.blockchain.tokens as _warm_tokens  # noqa: F401
+    import strategies.dex_aggregator.pool_math as _warm_pool_math  # noqa: F401
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "6.2.0")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "6.2.1")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -129,8 +143,12 @@ _DISCOVERY_CALL_TIMEOUT_S = float(os.environ.get("KING_DISCOVERY_CALL_TIMEOUT_S"
 # Earlier (4.0 / 22.0) the watchdog fired BELOW the window genesis itself gets,
 # regressing to a blind snapshot plan on heavy pairs (cbBTC) that genesis would
 # have completed under the cap. Give the work thread (nearly) the full window.
-_HARD_QUOTE_DEADLINE_S = float(os.environ.get("KING_HARD_QUOTE_DEADLINE_S", "4.7"))
+_HARD_QUOTE_DEADLINE_S = float(os.environ.get("KING_HARD_QUOTE_DEADLINE_S", "4.6"))
 _HARD_PLAN_DEADLINE_S = float(os.environ.get("KING_HARD_PLAN_DEADLINE_S", "27.0"))
+# Hard clamps: never let an env override push a deadline so close to the harness
+# cap (5s / 30s) that the thread join + RPC-free fallback could cross it.
+_HARD_QUOTE_DEADLINE_S = min(_HARD_QUOTE_DEADLINE_S, 4.7)
+_HARD_PLAN_DEADLINE_S = min(_HARD_PLAN_DEADLINE_S, 28.5)
 
 # Budgets used WITHIN the work thread. The scan's internal deadline is measured
 # from the work thread's entry and kept well under the plan watchdog so the scan
@@ -707,7 +725,29 @@ class MinerSolver(BaselineSwapSolver):
             tls.in_watchdog = True
             tls.snapshot_only = True
             try:
-                return BaselineSwapSolver.quote(self, intent, state, snapshot)
+                q = BaselineSwapSolver.quote(self, intent, state, snapshot)
+                # The genesis snapshot estimate is priced from stale synthetic
+                # pools (hardcoded prices). For SYNTHETIC orders the harness sets
+                # min = estimate*0.5, so an estimate above the live-delivered
+                # output can push min over delivery -> revert -> 0. Apply the same
+                # conservative reduction the main path uses so the fallback's min
+                # can never exceed what the live path would have set.
+                try:
+                    est = int(q.estimated_output or 0)
+                    if est > 0:
+                        return QuoteResult(
+                            estimated_output=str(int(est * _BLIND_SAFETY)),
+                            computed_params=dict(q.computed_params or {}),
+                            route_summary=q.route_summary,
+                            gas_estimate=q.gas_estimate,
+                            metadata={**(q.metadata or {}), "king_fallback": True},
+                            platform_fee_wei=q.platform_fee_wei,
+                            platform_fee_token=q.platform_fee_token,
+                            platform_fee_symbol=q.platform_fee_symbol,
+                        )
+                except Exception:
+                    pass
+                return q
             finally:
                 tls.in_watchdog = False
                 tls.snapshot_only = prev
