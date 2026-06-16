@@ -16,29 +16,32 @@ no-slippage estimates. Measured on Base: genesis returns no route on 500+ WETH
 while the real multi-tick QuoterV2 shows the same pool delivers ~868k USDC.
 
 v5 overrides route SELECTION with the real QuoterV2: it scans the discovered
-pools' tiers (and same-DEX 2-hops through USDC/WETH) by ACTUAL multi-tick output
-and adopts a route only if it beats genesis's route. The plan is built by
+pools' tiers (and same-DEX 2-hops through the chain's hubs) by ACTUAL multi-tick
+output and adopts a route only if it beats genesis's. The plan is built by
 genesis's OWN builders from the chosen hops; the quote is the accurate price.
 
 WHERE THE WORK RUNS (the critical harness constraint):
-  * ``quote()`` has a 5s harness timeout (Command.QUOTE). It must stay fast — it
-    only RE-PRICES the already-chosen route (v4.0 logic, <=3 calls). It NEVER runs
-    the route scan. Crucially, self-quote is only applied to SYNTHETIC scenarios
-    (historical orders skip it), and synthetic orders are small enough that
-    genesis routes them fine — so quote() pricing genesis's route is correct.
+  * ``quote()`` has a 5s harness timeout. It only RE-PRICES the already-chosen
+    route (v4.0 logic, <=3 calls). It NEVER runs the route scan. (self-quote is
+    applied only to SYNTHETIC scenarios, which are small enough that genesis
+    routes them fine — so quote() pricing genesis's route is correct.)
   * ``generate_plan()`` has a 30s budget. The expensive real-quote route SCAN runs
     ONLY here (gated by ``_king_allow_scan``). This is where the historical-order
     routing win is realised (delivered output is what the historical score grades).
 
-Safety rails (v2.2 / xl-crash lessons, all verified):
+Safety rails (every one verified by adversarial review):
   * NEVER REGRESS: adopt the v5 route only if genesis found NO route at all, OR
-    v5's real output STRICTLY beats genesis's MEASURED real output by a margin. If
-    genesis's route can't be measured (RPC flake -> 0), keep genesis — never
-    switch on an unmeasured comparison.
+    v5's real output STRICTLY beats genesis's MEASURED real output by a margin
+    (+1% for 2-hop, +0.3% direct). If genesis's route can't be measured (RPC
+    flake -> 0), keep genesis — never switch on an unmeasured comparison.
   * EXECUTABLE ONLY: 2-hop candidates must be SAME-DEX (one router); direct always
     executes. Hops carry full pool_state, so genesis's builders accept them.
-  * BOUNDED + DEADLINE: per-leg pool cap + a wall-clock budget under each harness
-    timeout; a per-input decision cache (with TTL) avoids re-scanning. Never raises.
+  * BOUNDED TIME, two ways: a dedicated quoter web3 with a hard PER-CALL timeout
+    (so a hung RPC can't blow the budget), AND a wall-clock budget measured from
+    generate_plan() entry (so genesis discovery + scan stays under 30s). A
+    per-input decision cache (with TTL) avoids re-scanning. Never raises.
+  * CROSS-CHAIN SAFE: cross-chain orders (via dest_chain_id or CAIP chain ids)
+    route through genesis's bridge path; quote() returns genesis's quote untouched.
 """
 
 from __future__ import annotations
@@ -62,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "5.0.0")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "5.0.1")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -78,46 +81,76 @@ _SEL_AERO_SINGLE = "9e7defe6"  # quoteExactInputSingle((address,address,uint256,
 _REPRICE_SAFETY = float(os.environ.get("KING_REPRICE_SAFETY", "0.99"))    # 1%
 _BLIND_SAFETY = float(os.environ.get("KING_BLIND_SAFETY", "0.90"))        # 10%
 
-# Wall-clock budgets, each WELL UNDER its harness timeout (quote()=5s, plan=30s).
-# quote() only re-prices the chosen route (<=3 calls). The route SCAN runs only in
-# generate_plan(), where there is ample budget.
-_QUOTE_BUDGET_S = float(os.environ.get("KING_QUOTE_BUDGET_S", "3.0"))     # quote() <5s cap
-_ROUTE_BUDGET_S = float(os.environ.get("KING_ROUTE_BUDGET_S", "12.0"))    # generate_plan() <30s cap
+# Hard PER-CALL timeout for our quoter eth_calls (seconds). A hung RPC otherwise
+# inherits web3's 30s default and blows the worker budget despite the wall-clock
+# deadline (which is only checked BETWEEN calls). Isolated to our own provider so
+# genesis's discovery calls keep their default.
+_RPC_CALL_TIMEOUT_S = float(os.environ.get("KING_RPC_CALL_TIMEOUT_S", "2.5"))
 
-# Route-decision cache TTL — invalidates a stale decision (its hops embed pool
-# snapshots) so a long-lived process can't reuse a minutes-old route.
+# Budgets. quote()<5s harness cap; generate_plan()<30s cap. The scan budget is
+# measured from generate_plan() ENTRY (covers genesis discovery + scan), not from
+# after discovery, so a cold-cache block can't compound past the worker timeout.
+_QUOTE_BUDGET_S = float(os.environ.get("KING_QUOTE_BUDGET_S", "3.0"))
+_ROUTE_BUDGET_S = float(os.environ.get("KING_ROUTE_BUDGET_S", "12.0"))      # scan slice
+_PLAN_TOTAL_BUDGET_S = float(os.environ.get("KING_PLAN_TOTAL_BUDGET_S", "20.0"))  # from plan entry
+
+# Route-decision cache TTL — its hops embed pool snapshots, so a stale entry must
+# not be reused minutes later.
 _DECISION_TTL_S = float(os.environ.get("KING_DECISION_TTL_S", "10.0"))
 
 # Don't re-price absurdly long routes.
 _MAX_REPRICE_HOPS = int(os.environ.get("KING_MAX_REPRICE_HOPS", "3"))
 
-# Routing scan limits. v5 adopts a route only if it STRICTLY beats genesis's real
-# delivered output by this margin (no churn on numerical ties). Pools-per-leg cap
-# bounds the quoter fan-out.
-_ROUTE_IMPROVE_MARGIN = float(os.environ.get("KING_ROUTE_IMPROVE", "1.003"))  # +0.3%
+# Adopt a v5 route only if it STRICTLY beats genesis's real output by this margin.
+# 2-hops carry extra slippage/gas the per-leg single-quoter doesn't capture, so
+# they need a wider margin.
+_ROUTE_IMPROVE_MARGIN = float(os.environ.get("KING_ROUTE_IMPROVE", "1.003"))        # +0.3% direct
+_ROUTE_IMPROVE_MARGIN_2HOP = float(os.environ.get("KING_ROUTE_IMPROVE_2HOP", "1.01"))  # +1% 2-hop
 _MAX_LEG_POOLS = int(os.environ.get("KING_MAX_LEG_POOLS", "8"))
 
-# Hub tokens for same-DEX 2-hop candidates (Base). USDC + WETH are the deep hubs.
+# Fallback hub tokens for same-DEX 2-hop (Base) when the registry lookup fails.
 _USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 _WETH_BASE = "0x4200000000000000000000000000000000000006"
 _ROUTE_INTERMEDIARIES = {8453: (_USDC_BASE, _WETH_BASE)}
 
 
 class MinerSolver(BaselineSwapSolver):
-    """Genesis baseline + real-quote route selection + QuoterV2-accurate quote.
-
-    Routing is upgraded in generate_plan() (pick the route that REALLY delivers
-    most); the plan is built by genesis's own builders from well-formed hops; the
-    quote is the accurate price of the chosen route.
-    """
+    """Genesis baseline + real-quote route selection + QuoterV2-accurate quote."""
 
     # ── quoter primitives ───────────────────────────────────────────────────
+    def _quoter_web3(self, chain_id: int):
+        """A dedicated web3 for our quoter calls, with a HARD per-call timeout.
+
+        Separate from genesis's cached provider so our 2.5s cap can't break
+        genesis's (potentially heavier) discovery calls, and so a hung quoter RPC
+        returns fast instead of blowing the worker budget.
+        """
+        try:
+            cid = int(chain_id)
+        except (TypeError, ValueError):
+            return None
+        cache = getattr(self, "_king_quoter_web3", None)
+        if cache is None:
+            cache = self._king_quoter_web3 = {}
+        if cid in cache:
+            return cache[cid]
+        rpc_url = self._rpc_urls.get(cid)
+        if not rpc_url:
+            return None
+        try:
+            from web3 import Web3
+            w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": _RPC_CALL_TIMEOUT_S}))
+            cache[cid] = w3
+            return w3
+        except Exception:
+            return None
+
     def _qcall(self, chain_id: int, to_addr: str, data_hex: str) -> int:
-        """One view eth_call. Returns first 32 bytes as int, 0 on any failure."""
+        """One view eth_call (timeout-bounded). First 32 bytes as int, 0 on any failure."""
         if not to_addr:
             return 0
         try:
-            w3 = self._get_web3(int(chain_id))
+            w3 = self._quoter_web3(int(chain_id))
             if w3 is None:
                 return 0
             raw = w3.eth.call({"to": to_addr, "data": "0x" + data_hex})
@@ -165,10 +198,6 @@ class MinerSolver(BaselineSwapSolver):
         self, chain_id: int, hops: list[dict[str, Any]],
         token_in: str, token_out: str, amount_in: int, deadline: float,
     ) -> int:
-        """Price a route leg-by-leg via the real quoter, chaining current->next.
-
-        Returns the composed delivered output, or 0 to fall back.
-        """
         if not hops or len(hops) > _MAX_REPRICE_HOPS:
             return 0
         current = (token_in or "").lower()
@@ -201,8 +230,18 @@ class MinerSolver(BaselineSwapSolver):
         return amt
 
     # ── real-quote route selection (v5) ─────────────────────────────────────
+    def _route_intermediaries(self, chain_id: int):
+        """Hub tokens for 2-hop, preferring genesis's registry set (so we scan the
+        same hubs genesis discovered pools for); falls back to our constants."""
+        try:
+            hubs = self._intermediaries_for_chain(int(chain_id))
+            if hubs:
+                return tuple(hubs)
+        except Exception:
+            pass
+        return _ROUTE_INTERMEDIARIES.get(int(chain_id), ())
+
     def _pair_pools(self, pool_states, tin, tout):
-        """Yield (addr, pool_state) for discovered pools matching {tin,tout}."""
         a, b = (tin or "").lower(), (tout or "").lower()
         n = 0
         for addr, p in (pool_states or {}).items():
@@ -224,6 +263,9 @@ class MinerSolver(BaselineSwapSolver):
             if out > best_out:
                 best_out = out
                 best_dex = self._hop_pool_dex(p)
+                # NB: "fee" here is dead for Aerodrome hops — the Aero plan builders
+                # read tickSpacing from pool_state, not hop["fee"]. Don't start
+                # trusting hop["fee"] for Aero in future edits.
                 best_hop = {
                     "pool_addr": addr, "pool_state": p, "fee": int(p.get("fee", 3000)),
                 }
@@ -238,7 +280,7 @@ class MinerSolver(BaselineSwapSolver):
         direct = self._best_real_leg(chain_id, pool_states, tin, tout, amt, deadline)
         if direct:
             best_out, best_hops = direct[0], [direct[1]]
-        for mid in _ROUTE_INTERMEDIARIES.get(int(chain_id), ()):  # type: ignore[arg-type]
+        for mid in self._route_intermediaries(chain_id):
             if time.monotonic() > deadline:
                 break
             ml = (mid or "").lower()
@@ -258,32 +300,24 @@ class MinerSolver(BaselineSwapSolver):
 
     # ── plan generation: enable the route scan here (30s budget) ────────────
     def generate_plan(self, intent, state, snapshot=None):
-        """Genesis plan generation, with the v5 route scan enabled.
+        """Genesis plan generation with the v5 route scan enabled.
 
-        The scan is heavy (quoter fan-out), so it runs ONLY in this 30s-budget
-        path — never in the 5s quote() path. generate_plan routes via our
-        _find_best_executable_route override, which (with the scan flag on) picks
-        the real-quote-best route and builds the plan from it via genesis's
-        builders.
+        Stamps a wall-clock deadline from ENTRY so genesis discovery + our scan
+        together stay under the 30s worker budget.
         """
         self._king_allow_scan = True
+        self._king_plan_deadline = time.monotonic() + _PLAN_TOTAL_BUDGET_S
         try:
             return super().generate_plan(intent, state, snapshot)
         finally:
             self._king_allow_scan = False
+            self._king_plan_deadline = None
 
     def _find_best_executable_route(
         self,
         pool_states: dict[str, dict[str, Any]],
         token_in: str, token_out: str, amount_in: int, chain_id: int,
     ):
-        """Pick the route that REALLY delivers most (scan in generate_plan only).
-
-        In the quote() path (scan flag off) this is genesis's route, unchanged and
-        fast — we only stash it for re-pricing. In the generate_plan() path (scan
-        flag on) it runs the real-quote scan and adopts a strictly-better route,
-        never regressing.
-        """
         genesis = super()._find_best_executable_route(
             pool_states, token_in, token_out, amount_in, chain_id,
         )
@@ -300,8 +334,6 @@ class MinerSolver(BaselineSwapSolver):
         now = time.monotonic()
         allow_scan = bool(getattr(self, "_king_allow_scan", False))
 
-        # Reuse a fresh decision for the same key — but if it was made WITHOUT a
-        # scan and we are now allowed to scan (generate_plan), re-evaluate.
         cache = getattr(self, "_king_route_decision", None)
         if (
             cache is not None and key is not None and cache.get("key") == key
@@ -316,24 +348,32 @@ class MinerSolver(BaselineSwapSolver):
         if allow_scan:
             try:
                 if pool_states and amt > 0 and token_in and token_out:
+                    # Bound the scan by BOTH a fresh slice budget and the absolute
+                    # plan deadline (covers prior genesis discovery time).
+                    plan_dl = getattr(self, "_king_plan_deadline", None)
                     deadline = now + _ROUTE_BUDGET_S
+                    if plan_dl is not None:
+                        deadline = min(deadline, plan_dl)
                     v_out, v_hops = self._best_real_route(
                         chain_id, pool_states, token_in, token_out, amt, deadline,
                     )
                     if v_hops and v_out > 0:
                         if genesis is None:
                             # genesis found NO executable route -> any deliverable
-                            # v5 route is strictly better.
+                            # v5 route is strictly better than reverting to 0.
                             chosen = (v_out, "king v5 real-route", v_hops)
                         else:
                             g_real = self._accurate_route_output(
                                 chain_id, genesis[2], token_in, token_out, amt, deadline,
                             ) or 0
-                            # Switch ONLY on a measured, strict improvement. If
-                            # g_real is 0 (couldn't price genesis's route — RPC
-                            # flake or genuine 0), keep genesis: never adopt on an
-                            # unmeasured comparison.
-                            if g_real > 0 and v_out > g_real * _ROUTE_IMPROVE_MARGIN:
+                            margin = (
+                                _ROUTE_IMPROVE_MARGIN_2HOP if len(v_hops) > 1
+                                else _ROUTE_IMPROVE_MARGIN
+                            )
+                            # Switch ONLY on a measured, strict improvement. g_real
+                            # == 0 (unmeasurable -> RPC flake or genuine 0) keeps
+                            # genesis: never switch on an unmeasured comparison.
+                            if g_real > 0 and v_out > g_real * margin:
                                 chosen = (v_out, "king v5 real-route", v_hops)
                                 logger.info(
                                     "king-01 v5 route: %s->%s amt=%d  genesis_real=%d -> v5=%d (hops=%d)",
@@ -350,6 +390,23 @@ class MinerSolver(BaselineSwapSolver):
         return chosen
 
     # ── quote: fast accurate price of the chosen route (v4.0, <5s) ──────────
+    def _is_cross_chain(self, state, swap) -> bool:
+        """Mirror genesis's cross-chain detection (CAIP chain ids OR dest_chain_id)."""
+        try:
+            in_chain = swap.get("_input_chain", state.chain_id)
+            out_chain = swap.get("_output_chain", state.chain_id)
+            if in_chain and out_chain and int(in_chain) != int(out_chain):
+                return True
+        except (TypeError, ValueError):
+            pass
+        try:
+            from strategies.dex_aggregator.baseline_solver import _cross_chain_compat_params
+            if _cross_chain_compat_params(state).get("dest_chain_id"):
+                return True
+        except Exception:
+            pass
+        return False
+
     def quote(
         self,
         intent: AppIntentDefinition,
@@ -357,6 +414,12 @@ class MinerSolver(BaselineSwapSolver):
         snapshot=None,
     ) -> QuoteResult:
         q = super().quote(intent, state, snapshot)  # routes via our override (no scan)
+
+        # Cross-chain orders route through genesis's bridge path (estimated_output
+        # = bridged, computed_params carry the bridge min). Do NOT re-price/slash
+        # them — that would emit min_output > estimate. Return genesis's quote.
+        if (q.metadata or {}).get("cross_chain"):
+            return q
 
         try:
             genesis_est = int(q.estimated_output or 0)
@@ -366,23 +429,15 @@ class MinerSolver(BaselineSwapSolver):
             return q
 
         swap = self._normalized_swap_params(intent, state)
+        if self._is_cross_chain(state, swap):
+            return q
+
         token_in = swap.get("input_token", "")
         token_out = swap.get("output_token", "")
         try:
             amount_in = int(swap.get("input_amount", 0) or 0)
         except (TypeError, ValueError):
             amount_in = 0
-
-        # Cross-chain orders route via genesis's _quote_cross_chain (NOT our
-        # single-chain router), so there is no single-chain route to re-price and
-        # the decision cache would be stale — return genesis's quote unchanged.
-        in_chain = swap.get("_input_chain", state.chain_id)
-        out_chain = swap.get("_output_chain", state.chain_id)
-        try:
-            if in_chain and out_chain and int(in_chain) != int(out_chain):
-                return q
-        except (TypeError, ValueError):
-            pass
 
         meta = q.metadata or {}
         hops_n = int(meta.get("hops") or 0)
@@ -409,10 +464,6 @@ class MinerSolver(BaselineSwapSolver):
         if accurate <= 0:
             accurate = int(genesis_est * _BLIND_SAFETY)
 
-        # accurate = real(chosen route) * 0.99 <= genesis_est both when we kept
-        # genesis's route (single-tick over-estimate) and when generate_plan later
-        # re-routes (genesis_est here reflects genesis's route; the plan may
-        # deliver MORE, which only loosens the min — never a revert).
         new_est = min(genesis_est, accurate) if accurate > 0 else genesis_est
         if new_est <= 0 or new_est == genesis_est:
             return q
