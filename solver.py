@@ -109,7 +109,7 @@ logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "6.2.1")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "6.2.2")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -204,7 +204,13 @@ class MinerSolver(BaselineSwapSolver):
                 box["e"] = exc
 
         t = threading.Thread(target=_runner, name="king-watchdog", daemon=True)
-        t.start()
+        try:
+            t.start()
+        except RuntimeError:
+            # Can't create a thread (e.g. container pids-limit pressure). No work
+            # thread exists, so there is no race — run the RPC-free fallback
+            # inline on the main thread rather than letting a bare error score 0.
+            return fallback()
         t.join(deadline_s)
 
         if not t.is_alive() and "v" in box:
