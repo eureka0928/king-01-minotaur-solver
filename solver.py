@@ -50,23 +50,6 @@ regression the v6.0 watchdog alone did NOT close):
     recursion run the genesis body inline instead of stacking a second 22s+22s
     watchdog (which could double main-thread time past the 30s cap).
 
-v7.0 — DISCOVERY PARITY (fix the v6.2.2 regression). v6.2.2 scored 0.6649 but
-REGRESSED below the champion (0.7768) on synthetic DAI_to_USDC=0 — a LIQUID pair
-that, on Base, needs live factory discovery (``_KNOWN_POOLS[8453]`` seeds only
-WETH/USDC). v6's ``retries=1`` (added to kill the read-Timeout multiplication)
-also dropped genesis's transient-error retries, so a single 429/5xx/reset under
-validator load dropped the DAI pool -> no route -> 0, where genesis's retries=5
-survives. v7 fixes it by realising the WATCHDOG — not the retry count — is what
-prevents the worker-kill, so discovery can now match genesis's resilience:
-  * ``_make_web3`` retries ConnectionError/HTTPError (genesis-level) but EXCLUDES
-    read ``Timeout`` from the retry set (no 5x multiply on a hung socket).
-  * discovery per-call timeout 3s -> 8s (wait for slow-but-valid calls; the
-    watchdog bounds the aggregate, so this no longer risks a kill).
-  * quote watchdog 4.6 -> 4.8s (give the work thread more of genesis's window
-    before falling back to the DAI-less snapshot; RPC-free fallback is sub-ms).
-The result: on the happy path v7 discovers exactly what the champion discovers
-(never regresses) while the watchdog still guarantees no timeout/kill.
-
 Everything else is v5: real-QuoterV2 route SELECTION in ``generate_plan()`` (beats
 genesis's single-tick router on the large/illiquid orders it zeroes — genesis's
 ``compute_v3_output`` ZEROES any pool swap over ~2% price impact, so it finds NO
@@ -126,7 +109,7 @@ logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "7.0.1")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "6.2.2")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -147,17 +130,9 @@ _BLIND_SAFETY = float(os.environ.get("KING_BLIND_SAFETY", "0.90"))        # 10%
 # deadline (which is only checked BETWEEN calls).
 _RPC_CALL_TIMEOUT_S = float(os.environ.get("KING_RPC_CALL_TIMEOUT_S", "2.5"))
 
-# PER-CALL timeout for genesis's OWN pool-discovery calls. Now that the WATCHDOG
-# bounds the aggregate wall-clock, this can be GENEROUS (wait for slow-but-valid
-# calls like genesis's 30s default does) instead of so tight it drops a pool a
-# slow call would have returned. The watchdog (27s plan / ~4.8s quote) is the
-# real ceiling; on the quote path it dominates this per-call value anyway.
-_DISCOVERY_CALL_TIMEOUT_S = float(os.environ.get("KING_DISCOVERY_CALL_TIMEOUT_S", "8.0"))
-
-# Retries for genesis-discovery + quoter web3 on TRANSIENT errors (not read
-# Timeout — see _make_web3). Matches genesis's default resilience so we never
-# drop a factory-discovered pool the champion keeps (the v6.2.2 DAI regression).
-_DISCOVERY_RETRIES = int(os.environ.get("KING_DISCOVERY_RETRIES", "4"))
+# Hard PER-CALL timeout for genesis's OWN pool-discovery calls. v5 left these on
+# web3's unbounded default — the direct cause of the cbBTC_to_WETH 30s kill.
+_DISCOVERY_CALL_TIMEOUT_S = float(os.environ.get("KING_DISCOVERY_CALL_TIMEOUT_S", "3.0"))
 
 # WATCHDOG hard deadlines. These are the wall-clock ceilings on the whole call;
 # if the work thread isn't done by then we return a snapshot-only fallback. Set
@@ -168,15 +143,11 @@ _DISCOVERY_RETRIES = int(os.environ.get("KING_DISCOVERY_RETRIES", "4"))
 # Earlier (4.0 / 22.0) the watchdog fired BELOW the window genesis itself gets,
 # regressing to a blind snapshot plan on heavy pairs (cbBTC) that genesis would
 # have completed under the cap. Give the work thread (nearly) the full window.
-_HARD_QUOTE_DEADLINE_S = float(os.environ.get("KING_HARD_QUOTE_DEADLINE_S", "4.7"))
+_HARD_QUOTE_DEADLINE_S = float(os.environ.get("KING_HARD_QUOTE_DEADLINE_S", "4.6"))
 _HARD_PLAN_DEADLINE_S = float(os.environ.get("KING_HARD_PLAN_DEADLINE_S", "27.0"))
 # Hard clamps: never let an env override push a deadline so close to the harness
-# cap (5s / 30s) that the thread join + RPC-free fallback could cross it. Quote
-# held at 4.7 (verified-clean: 0.30s host-side margin under a black-hole RPC) —
-# the DAI regression's true cause was bounded retries dropping the discovered
-# pool, NOT the watchdog firing early, so 4.7 keeps the safer margin without
-# costing coverage. The eager-warmed, RPC-free fallback is sub-ms.
-_HARD_QUOTE_DEADLINE_S = min(_HARD_QUOTE_DEADLINE_S, 4.75)
+# cap (5s / 30s) that the thread join + RPC-free fallback could cross it.
+_HARD_QUOTE_DEADLINE_S = min(_HARD_QUOTE_DEADLINE_S, 4.7)
 _HARD_PLAN_DEADLINE_S = min(_HARD_PLAN_DEADLINE_S, 28.5)
 
 # Budgets used WITHIN the work thread. The scan's internal deadline is measured
@@ -256,27 +227,17 @@ class MinerSolver(BaselineSwapSolver):
                 raise box["e"]
             raise
 
-    # ── web3 builder: retry TRANSIENT errors like genesis, but not read-hangs ─
+    # ── web3 builder: hard per-call timeout AND retries DISABLED ─────────────
     @staticmethod
-    def _make_web3(rpc_url: str, timeout: float, retries: int = _DISCOVERY_RETRIES):
-        """Build a Web3 that matches genesis's pool-discovery RESILIENCE without
-        its worker-kill exposure.
+    def _make_web3(rpc_url: str, timeout: float):
+        """Build a Web3 whose per-call timeout is a TRUE wall-clock ceiling.
 
-        Genesis discovers Base pools (DAI/USDC, cbBTC/*) via live factory getPool
-        with web3's default retries=5, so a TRANSIENT RPC error (429/5xx/reset
-        under validator load) is retried and the pool is still found. v6 disabled
-        retries entirely (retries=1) to kill the read-Timeout *multiplication*
-        (5x the per-call timeout on a hung socket = the v5 worker-kill) — but that
-        also dropped transient-error retries, so v6 lost pools genesis keeps. That
-        was the v6.2.2 DAI_to_USDC=0 REGRESSION (a liquid pair that needs factory
-        discovery on Base, where _KNOWN_POOLS seeds only WETH/USDC).
-
-        v7 retries ConnectionError/HTTPError (genesis-level resilience -> no pool
-        drops) but EXCLUDES the read ``Timeout`` from the retry set, so a hung
-        socket is a single attempt (bounded by ``timeout``), never a 5x multiply.
-        Safety no longer rests on the retry count at all: the WATCHDOG bounds the
-        aggregate wall-clock (plan 27s, quote ~4.8s) and abandons the thread on
-        overrun, so retries are now purely a pool-drop knob, not a kill knob.
+        web3 7.x defaults the HTTPProvider to retries=5 on the
+        eth_call/eth_gasPrice/eth_getStorageAt allowlist, silently multiplying
+        the requests ``timeout`` ~5x (a 3s call becomes ~17s on a hung/throttling
+        RPC). That defeats the per-call bound the watchdog budgets around and was
+        a confirmed worker-kill path. retries=1 (one attempt) restores the
+        per-call timeout as a real ceiling.
         """
         from web3 import Web3
         prov = Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": timeout})
@@ -284,18 +245,19 @@ class MinerSolver(BaselineSwapSolver):
             from web3.providers.rpc.utils import ExceptionRetryConfiguration
             import requests as _rq
             prov.exception_retry_configuration = ExceptionRetryConfiguration(
-                # NOTE: requests.exceptions.Timeout is deliberately ABSENT so a
-                # read-hang is one attempt. ConnectTimeout (a ConnectionError) may
-                # still retry, but the watchdog bounds the aggregate regardless.
-                errors=(_rq.exceptions.ConnectionError, _rq.exceptions.HTTPError),
-                retries=int(retries),
-                backoff_factor=0.1,
+                errors=(
+                    _rq.exceptions.ConnectionError,
+                    _rq.exceptions.HTTPError,
+                    _rq.exceptions.Timeout,
+                ),
+                retries=1,
+                backoff_factor=0.0,
             )
         except Exception:
-            # If the retry API shifts, leave web3's default. The watchdog — not
-            # the retry config — is what prevents the worker-kill, so the default
-            # (retries=5, incl. Timeout) is still safe here.
-            pass
+            try:
+                prov.exception_retry_configuration.retries = 1
+            except Exception:
+                pass
         return Web3(prov)
 
     # ── bounded, thread-local discovery web3 (overrides genesis's unbounded) ─
