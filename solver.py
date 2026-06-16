@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 SOLVER_NAME = os.environ.get("MINOTAUR_SOLVER_NAME", "king-01-solver")
-SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "5.0.1")
+SOLVER_VERSION = os.environ.get("MINOTAUR_SOLVER_VERSION", "5.0.2")
 SOLVER_AUTHOR = os.environ.get("MINOTAUR_SOLVER_AUTHOR", "king-01")
 
 # Uniswap V3 QuoterV2 (uint24 fee) + Aerodrome Slipstream QuoterV2 (int24
@@ -401,7 +401,11 @@ class MinerSolver(BaselineSwapSolver):
             pass
         try:
             from strategies.dex_aggregator.baseline_solver import _cross_chain_compat_params
-            if _cross_chain_compat_params(state).get("dest_chain_id"):
+            dest = _cross_chain_compat_params(state).get("dest_chain_id")
+            # Only cross-chain when dest differs from the source chain — a
+            # self-referential dest == chain_id is a normal same-chain order
+            # (genesis treats it as such), so don't skip our re-pricing.
+            if dest and int(dest) != int(state.chain_id):
                 return True
         except Exception:
             pass
